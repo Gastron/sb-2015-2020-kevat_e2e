@@ -1,0 +1,217 @@
+# ############################################################################
+# Model: E2E ASR with attention-based ASR
+# Training data: FINNISH PARLIAMENT
+# Encoder: Transformer 
+# Decoder: Transformer 
+# Authors: Aku Rouhe 2021 
+# ############################################################################
+
+# Seed needs to be set at top of yaml, before objects with parameters are instantiated
+seed: 2602
+__set_seed: !apply:torch.manual_seed [!ref <seed>]
+
+trainshards: ./train-shards/shard-000{000..210}.tar
+validshards: ./dev-shards/shard-000000.tar
+test_seen_shards: ./test-seen-shards/shard-000000.tar
+test_unseen_shards: ./test-unseen-shards/shard-000000.tar
+validsamples: 1797 
+# data_folder_rirs: ./augmentation_data # noise/ris dataset will automatically be downloaded here
+num_units: 1750
+output_folder: !ref exp/TRAFO-B/<seed>-<num_units>units
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+tokenizer_path: !ref exp/spm-full-boseos/spm.<num_units>.model
+
+tokenizer: !new:sentencepiece.SentencePieceProcessor
+    model_file: !ref <tokenizer_path>
+
+# The train logger writes training statistics to a file, as well as stdout.
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+# Training parameters
+number_of_epochs: 100
+number_of_ctc_epochs: 50
+dynamic_batch_kwargs:
+    max_sample_len: 640000 # 16000*40=0.66minutes
+    sampler_kwargs:
+        target_batch_numel: 1920000 
+        max_batch_numel: 2300000 
+    len_key: 'wav'
+valid_dynamic_batch_kwargs:
+    len_key: 'wav'
+    sampler_kwargs:
+        target_batch_numel: 640000
+        max_batch_numel: 960000 
+train_loader_kwargs:
+    num_workers: 4
+    looped_nominal_epoch: 20000
+validbatchsize: 4
+valid_loader_kwargs:
+    looped_nominal_epoch: 400
+ctc_weight: 0.3
+ckpt_interval_minutes: -1 # save checkpoint every N min
+label_smoothing: 0.1
+lr: 1.0
+loss_reduction: 'batchmean'
+ckpts_to_keep: 5
+avg_ckpts: 5
+gradient_accumulation: 4 
+# Feature parameters
+sample_rate: 16000
+n_fft: 400
+n_mels: 80
+
+# Model parameters
+model_dim: 768
+output_neurons: !ref <num_units>
+blank_index: 0
+bos_index: 1
+eos_index: 2
+unk_index: 0
+pad_index: 0
+
+# Decoding parameters
+test_data_id: "valid"
+min_decode_ratio: 0.0
+max_decode_ratio: 1.0
+valid_beam_size: 1
+test_beam_size: 12
+#eos_threshold: 1.2
+using_max_attn_shift: False
+max_attn_shift: 240
+ctc_weight_decode: 0.0
+#coverage_penalty: 3.0 
+temperature: 1.15
+wer_file: !ref <output_folder>/wer_<test_data_id>_beam<test_beam_size>_temp<temperature>.txt
+
+# The first object passed to the Brain class is this "Epoch Counter"
+# which is saved by the Checkpointer so that training can be resumed
+# if it gets interrupted at any point.
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+# Feature extraction
+compute_features: !new:speechbrain.lobes.features.Fbank
+    sample_rate: !ref <sample_rate>
+    n_fft: !ref <n_fft>
+    n_mels: !ref <n_mels>
+
+# Feature normalization (mean and std)
+normalize: !new:speechbrain.processing.features.InputNormalization
+    norm_type: global
+
+
+
+############################## models ################################
+
+CNN: !new:speechbrain.lobes.models.convolution.ConvolutionFrontEnd
+    input_shape: (8, 10, 80)
+    num_blocks: 3
+    num_layers_per_block: 1
+    out_channels: (128, 256, 512)
+    kernel_sizes: (3, 3, 1)
+    strides: (2, 2, 1)
+    residuals: (False, False, False)
+
+Transformer: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR # yamllint disable-line rule:line-length
+    input_size: 10240
+    tgt_vocab: !ref <output_neurons>
+    d_model: !ref <model_dim>
+    nhead: 8
+    num_encoder_layers: 12
+    num_decoder_layers: 6
+    d_ffn: 3072
+    dropout: 0.0
+    activation: !name:torch.nn.GELU
+    normalize_before: False 
+
+
+# Linear transformation on the top of the encoder.
+ctc_lin: !new:speechbrain.nnet.linear.Linear
+    input_size: !ref <model_dim>
+    n_neurons: !ref <output_neurons>
+
+# Linear transformation on the top of the decoder.
+seq_lin: !new:speechbrain.nnet.linear.Linear
+    input_size: !ref <model_dim>
+    n_neurons: !ref <output_neurons>
+
+# Final softmax (for log posteriors computation).
+log_softmax: !new:speechbrain.nnet.activations.Softmax
+    apply_log: True
+
+# Cost definition for the CTC part.
+ctc_cost: !name:speechbrain.nnet.losses.ctc_loss
+    blank_index: !ref <blank_index>
+    reduction: !ref <loss_reduction>
+
+seq_cost: !name:speechbrain.nnet.losses.kldiv_loss
+    label_smoothing: !ref <label_smoothing>
+    reduction: !ref <loss_reduction>
+
+
+modules:
+    CNN: !ref <CNN>
+    Transformer: !ref <Transformer>
+    seq_lin: !ref <seq_lin>
+    ctc_lin: !ref <ctc_lin>
+    normalize: !ref <normalize>
+
+model: !new:torch.nn.ModuleList
+    - [!ref <CNN>, !ref <Transformer>, !ref <seq_lin>, !ref <ctc_lin>]
+
+valid_search: !new:speechbrain.decoders.S2STransformerBeamSearch
+    modules: [!ref <Transformer>, !ref <seq_lin>, !ref <ctc_lin>]
+    bos_index: !ref <bos_index>
+    eos_index: !ref <eos_index>
+    blank_index: !ref <blank_index>
+    min_decode_ratio: !ref <min_decode_ratio>
+    max_decode_ratio: !ref <max_decode_ratio>
+    beam_size: !ref <valid_beam_size>
+    ctc_weight: !ref <ctc_weight_decode>
+    using_eos_threshold: False
+    length_normalization: False
+
+
+test_search: !new:speechbrain.decoders.S2STransformerBeamSearch
+    modules: [!ref <Transformer>, !ref <seq_lin>, !ref <ctc_lin>]
+    bos_index: !ref <bos_index>
+    eos_index: !ref <eos_index>
+    blank_index: !ref <blank_index>
+    min_decode_ratio: !ref <min_decode_ratio>
+    max_decode_ratio: !ref <max_decode_ratio>
+    beam_size: !ref <test_beam_size>
+    ctc_weight: !ref <ctc_weight_decode>
+    temperature: !ref <temperature>
+    using_eos_threshold: False
+    length_normalization: True
+
+
+noam_annealing: !new:speechbrain.nnet.schedulers.NoamScheduler
+    lr_initial: !ref <lr>
+    n_warmup_steps: 25000
+    model_size: !ref <model_dim>
+
+opt_class: !name:torch.optim.Adam
+    lr: 0
+    betas: (0.9, 0.98)
+    eps: 0.000000001
+
+# Functions that compute the statistics to track during the validation step.
+error_rate_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+
+cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+    split_tokens: True
+
+acc_computer: !name:speechbrain.utils.Accuracy.AccuracyStats
+
+# This object is used for saving the state of training both so that it
+# can be resumed if it gets interrupted, and also so that the best checkpoint
+# can be later loaded for evaluation or inference.
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        model: !ref <model>
+        normalizer: !ref <normalize>
+        counter: !ref <epoch_counter>

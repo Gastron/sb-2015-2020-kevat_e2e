@@ -78,16 +78,27 @@ class ASR(sb.Brain):
         """
         # We first move the batch to the appropriate device.
         batch = batch.to(self.device)
-        feats, self.feat_lens = self.prepare_features(stage, batch.wav)
-        tokens_bos, _ = self.prepare_tokens(stage, batch.tokens_bos)
+        wavs, wav_lens = batch.wav
+        tokens_bos, _ = batch.tokens_bos
+        # Add augmentation if specified
+        if stage == sb.Stage.TRAIN:
+            if hasattr(self.modules, "env_corrupt"):
+                wavs = self.modules.env_corrupt(wavs, wav_lens)
 
-        # Running the encoder (prevent propagation to feature extraction)
-        encoded_signal = self.modules.encoder(feats.detach())
+        feats = self.modules.wav2vec2(wavs)
+        if self.hparams.subsampling == 2:
+            pass
+        elif self.hparams.subsampling == 3:
+            feats = torch.repeat_interleave(feats,2,dim=1)[:,::self.hparams.subsampling,:]
+        elif self.hparams.subsampling == 4:
+            feats = feats[:,::2,:]
+
+        encoded_signal = self.modules.encoder(feats)
 
         # Embed tokens and pass tokens & encoded signal to decoder
         embedded_tokens = self.modules.embedding(tokens_bos)
         decoder_outputs, _ = self.modules.decoder(
-            embedded_tokens, encoded_signal, self.feat_lens
+            embedded_tokens, encoded_signal, batch.wav.lengths
         )
 
         # Output layer for seq2seq log-probabilities
@@ -107,11 +118,11 @@ class ASR(sb.Brain):
             predictions["ctc_logprobs"] = self.hparams.log_softmax(ctc_logits)
         elif stage == sb.Stage.VALID:
             predictions["tokens"], _ = self.hparams.valid_search(
-                encoded_signal, self.feat_lens
+                encoded_signal, batch.wav.lengths
             )
         elif stage == sb.Stage.TEST:
             predictions["tokens"], _ = self.hparams.test_search(
-                encoded_signal, self.feat_lens
+                encoded_signal, batch.wav.lengths
             )
 
         return predictions
@@ -128,53 +139,6 @@ class ASR(sb.Brain):
             return False
         current_epoch = self.hparams.epoch_counter.current
         return current_epoch <= self.hparams.number_of_ctc_epochs
-
-    def prepare_features(self, stage, wavs):
-        """Prepare features for computation on-the-fly
-
-        Arguments
-        ---------
-        stage : sb.Stage
-            Currently executing stage.
-        wavs : tuple
-            The input signals (tensor) and their lengths (tensor).
-        """
-        wavs, wav_lens = wavs
-
-        # Add augmentation if specified. In this version of augmentation, we
-        # concatenate the original and the augment batches in a single bigger
-        # batch. This is more memory-demanding, but helps to improve the
-        # performance. Change it if you run OOM.
-        if stage == sb.Stage.TRAIN:
-            if hasattr(self.modules, "env_corrupt"):
-                wavs_noise = self.modules.env_corrupt(wavs, wav_lens)
-                wavs = torch.cat([wavs, wavs_noise], dim=0)
-                wav_lens = torch.cat([wav_lens, wav_lens])
-
-            if hasattr(self.hparams, "augmentation"):
-                wavs = self.hparams.augmentation(wavs, wav_lens)
-
-        # Feature computation and normalization
-        feats = self.hparams.compute_features(wavs)
-        feats = self.modules.normalize(feats, wav_lens)
-
-        return feats, wav_lens
-
-    def prepare_tokens(self, stage, tokens):
-        """Double the tokens batch if features are doubled.
-
-        Arguments
-        ---------
-        stage : sb.Stage
-            Currently executing stage.
-        tokens : tuple
-            The tokens (tensor) and their lengths (tensor).
-        """
-        tokens, token_lens = tokens
-        if hasattr(self.modules, "env_corrupt") and stage == sb.Stage.TRAIN:
-            tokens = torch.cat([tokens, tokens], dim=0)
-            token_lens = torch.cat([token_lens, token_lens], dim=0)
-        return tokens, token_lens
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given the predicted and targeted outputs. We here
@@ -196,9 +160,7 @@ class ASR(sb.Brain):
             A one-element tensor used for backpropagating the gradient.
         """
         # Compute sequence loss against targets with EOS
-        tokens_eos, tokens_eos_lens = self.prepare_tokens(
-            stage, batch.tokens_eos
-        )
+        tokens_eos, tokens_eos_lens = batch.tokens_eos
         loss = sb.nnet.losses.nll_loss(
             log_probabilities=predictions["seq_logprobs"],
             targets=tokens_eos,
@@ -210,9 +172,9 @@ class ASR(sb.Brain):
         # ctc loss + seq2seq loss
         if self.is_ctc_active(stage):
             # Load tokens without EOS as CTC targets
-            tokens, tokens_lens = self.prepare_tokens(stage, batch.tokens)
+            tokens, tokens_lens = batch.tokens
             loss_ctc = self.hparams.ctc_cost(
-                predictions["ctc_logprobs"], tokens, self.feat_lens, tokens_lens
+                predictions["ctc_logprobs"], tokens, batch.wav.lengths, tokens_lens
             )
             loss *= 1 - self.hparams.ctc_weight
             loss += self.hparams.ctc_weight * loss_ctc
@@ -236,6 +198,42 @@ class ASR(sb.Brain):
             self.cer_metric.append(batch.__key__, predicted_words, target_words)
 
         return loss
+
+    def init_optimizers(self):
+        "Initializes the wav2vec2 optimizer and model optimizer"
+        if not self.hparams.wav2vec2.freeze:
+            self.wav2vec_optimizer = self.hparams.wav2vec_opt_class(
+                self.modules.wav2vec2.parameters()
+            )
+            if self.checkpointer is not None:
+                self.checkpointer.add_recoverable(
+                    "wav2vec_opt", self.wav2vec_optimizer
+                )
+        self.model_optimizer = self.hparams.model_opt_class(
+            self.hparams.model.parameters()
+        )
+
+        if self.checkpointer is not None:
+            self.checkpointer.add_recoverable("modelopt", self.model_optimizer)
+
+    def fit_batch(self, batch):
+        """Train the parameters given a single batch in input"""
+        should_step = self.step % self.hparams.grad_accumulation_factor == 0
+        outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+        loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+        (loss / self.hparams.grad_accumulation_factor).backward()
+
+        if should_step:
+            if self.check_gradients(loss):
+                if not self.hparams.wav2vec2.freeze:
+                    self.wav2vec_optimizer.step()
+                self.model_optimizer.step()
+        
+            if not self.hparams.wav2vec2.freeze:
+                self.wav2vec_optimizer.zero_grad()
+            self.model_optimizer.zero_grad()
+
+        return loss.detach()
 
     def on_stage_start(self, stage, epoch):
         """Gets called at the beginning of each epoch.
@@ -283,12 +281,14 @@ class ASR(sb.Brain):
         if stage == sb.Stage.VALID:
 
             # Update learning rate
-            old_lr, new_lr = self.hparams.lr_annealing(stage_stats["WER"])
-            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
+            old_lr_model, new_lr_model = self.hparams.lr_annealing_model(stage_stats["WER"])
+            sb.nnet.schedulers.update_learning_rate(self.model_optimizer, new_lr_model)
+            old_lr_w2v, new_lr_w2v = self.hparams.lr_annealing_wav2vec(stage_stats["WER"])
+            sb.nnet.schedulers.update_learning_rate(self.wav2vec_optimizer, new_lr_w2v)
 
             # The train_logger writes a summary to stdout and to the logfile.
             self.hparams.train_logger.log_stats(
-                stats_meta={"epoch": epoch, "lr": old_lr},
+                stats_meta={"epoch": epoch, "lr_model": old_lr_model, "lr_w2v": old_lr_w2v},
                 train_stats=self.train_stats,
                 valid_stats=stage_stats,
             )
@@ -537,7 +537,6 @@ if __name__ == "__main__":
     # Trainer initialization
     asr_brain = ASR(
         modules=hparams["modules"],
-        opt_class=hparams["opt_class"],
         hparams=hparams,
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],

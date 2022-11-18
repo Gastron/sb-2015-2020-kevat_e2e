@@ -16,8 +16,9 @@ import torchaudio
 sys.path.append("local/")
 from make_shards import segments_to_output, wavscp_to_output
 import pathlib
-
-
+from minwer import minWER_loss, minWER_loss_given, compute_subwers
+from speechbrain.utils.edit_distance import op_table, count_ops
+import numpy as np
 
 class KaldiData(torch.utils.data.IterableDataset):
     def __init__(self, datadir):
@@ -93,19 +94,29 @@ class ASR(sb.Brain):
         # Output layer for seq2seq log-probabilities
         logits = self.modules.seq_lin(decoder_outputs)
         predictions = {"seq_logprobs": self.hparams.log_softmax(logits)}
-        #p_seq = predictions["seq_logprobs"]
-        #_, max_indices = torch.sort(p_seq, dim=2, descending=True)
-        #for timestep, indices in enumerate(max_indices[0]):
-        #    print("Time:", timestep)
-        #    for i, ind in enumerate(indices[:2]):
-        #        print("\tTop", i, self.hparams.tokenizer.id_to_piece(ind.item()), p_seq[0,timestep,ind].exp())
-        #import sys; sys.exit()
 
-        if self.is_ctc_active(stage):
+        if self.is_ctc_active(stage) and stage == sb.Stage.TRAIN:
             # Output layer for ctc log-probabilities
             ctc_logits = self.modules.ctc_lin(encoded_signal)
             predictions["ctc_logprobs"] = self.hparams.log_softmax(ctc_logits)
-        elif stage == sb.Stage.VALID:
+
+        # MWER N-best
+        # set max decoding step to the label length
+        self.hparams.sampler.max_decode_ratio = (
+            batch.tokens.data.size(1) / encoded_signal.size(1) * 1.5
+        )
+        (
+            predicted_tokens,
+            topk_scores,
+            topk_hyps,
+            topk_lens,
+        ) = self.hparams.sampler(encoded_signal, self.feat_lens)
+        predictions["p_tokens"] = predicted_tokens
+        predictions["topk_scores"] = topk_scores
+        predictions["topk_hyps"] = topk_hyps
+        predictions["topk_lens"] = topk_lens
+        #return p_seq, wav_lens, topk_hyps, topk_scores, topk_len
+        if stage == sb.Stage.VALID:
             predictions["tokens"], _ = self.hparams.valid_search(
                 encoded_signal, self.feat_lens
             )
@@ -199,7 +210,7 @@ class ASR(sb.Brain):
         tokens_eos, tokens_eos_lens = self.prepare_tokens(
             stage, batch.tokens_eos
         )
-        loss = sb.nnet.losses.nll_loss(
+        nll_loss = sb.nnet.losses.nll_loss(
             log_probabilities=predictions["seq_logprobs"],
             targets=tokens_eos,
             length=tokens_eos_lens,
@@ -216,6 +227,68 @@ class ASR(sb.Brain):
             )
             loss *= 1 - self.hparams.ctc_weight
             loss += self.hparams.ctc_weight * loss_ctc
+        
+        if getattr(self.hparams, "minwertype", "SubWER") == "SubWER":
+            ref_abs_lengths = torch.round(batch.tokens_eos.lengths * batch.tokens_eos.data.size(1))
+            minwerloss = minWER_loss(
+                    hypotheses = predictions["topk_hyps"],
+                    targets = batch.tokens_eos.data,
+                    hyps_lens = predictions["topk_lens"],
+                    target_lens = ref_abs_lengths,
+                    hypotheses_scores = predictions["topk_scores"],
+                    blank_index = self.hparams.mwer_pad_index,
+                    subtract_avg = self.hparams.subtract_avg
+            )
+        elif getattr(self.hparams, "minwertype", "SubWER") == "TrueWER":
+            specials = [self.hparams.bos_index, self.hparams.eos_index, self.hparams.unk_index]
+            batchsize = len(batch)
+            wers = torch.zeros((batchsize,self.hparams.topk), dtype=torch.float32)
+            for i, target in enumerate(batch.trn):
+                # Ad hoc filter here:
+                target_words = [t in target.split() if t not in ["<UNK>"]] 
+                for j, hyp in enumerate(predictions["topk_hyps"][i]):
+                    hyp = hyp.cpu().tolist()
+                    hyp = [token for token in hyp if token not in specials]
+                    hyp = self.hparams.tokenizer.decode_ids(hyp).split(" ")
+                    ops = op_table(target_words, hyp)
+                    errors = sum(count_ops(ops).values())
+                    wers[i,j] = errors
+            minwerloss = minWER_loss_given(
+                    wers = wers,
+                    hypotheses_scores = predictions["topk_scores"],
+                    subtract_avg = self.hparams.subtract_avg
+            )
+            if hasattr(self.hparams, "save_num_errs"):
+                ref_abs_lengths = torch.round(batch.tokens_eos.lengths * batch.tokens_eos.data.size(1))
+                suberrors = compute_subwers(
+                    hypotheses = predictions["topk_hyps"],
+                    targets = batch.tokens_eos.data,
+                    hyps_lens = predictions["topk_lens"],
+                    target_lens = ref_abs_lengths,
+                )
+                suberrors = suberrors.cpu().tolist()
+                wordlevel_list = sum(wers.cpu().tolist(),[])
+                corr = np.corrcoef(np.array(wordlevel_list), np.array(suberrors))
+                if corr[0,1] < 0.6:
+                    for i, (suberr, worderr) in enumerate(zip(suberrors, wordlevel_list)):
+                        if suberr > worderr:
+                            k = self.hparams.topk
+                            hyp = predictions["topk_hyps"][i//k][i%k]
+                            hyp = hyp.cpu().tolist()
+                            print("Ref Units:", [self.hparams.tokenizer.id_to_piece(u) for u in batch.tokens_eos.data[i//k].cpu().tolist()])
+                            print("Units:", [self.hparams.tokenizer.id_to_piece(u) for u in hyp])
+                            hyp = [token for token in hyp if token not in specials]
+
+                            hyp = self.hparams.tokenizer.decode_ids(hyp).split(" ")
+                            print("Ref Word:", batch.trn[i//k].split())
+                            print("Word:", hyp)
+                    import sys; sys.exit()
+                    
+                #print("Batch level corr:", corr)
+                self.num_errs.setdefault("word", []).extend(wordlevel_list)
+                self.num_errs.setdefault("subword", []).extend(suberrors)
+
+        loss = nll_loss * self.hparams.nll_weight + minwerloss
 
         if stage != sb.Stage.TRAIN:
             # Converted predicted tokens from indexes to words
@@ -255,6 +328,9 @@ class ASR(sb.Brain):
             self.cer_metric = self.hparams.cer_computer()
             self.wer_metric = self.hparams.error_rate_computer()
 
+        if stage == sb.Stage.TRAIN:
+            self.num_errs = {}
+
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of an epoch.
 
@@ -268,6 +344,10 @@ class ASR(sb.Brain):
             The currently-starting epoch. This is passed
             `None` during the test stage.
         """
+        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "save_num_errs"):
+            wordlevel = torch.tensor(self.num_errs["word"])
+            sublevel = torch.tensor(self.num_errs["suberrors"])
+            print("Epoch total correlation:", torch.corrcoef(wordlevel, sublevel))
 
         # Store the train loss until the validation stage.
         stage_stats = {"loss": stage_loss}
@@ -357,6 +437,12 @@ def dataio_prepare(hparams):
         sample["tokens_bos"] = fulltokens[:-1]
         sample["tokens_eos"] = fulltokens[1:]
         return sample
+
+    def dirty_single_batch(iterator):
+        batch = next(iterator)
+        while True:
+            yield batch
+
     
     traindata = (
             wds.WebDataset(hparams["trainshards"])
@@ -369,30 +455,17 @@ def dataio_prepare(hparams):
                 **hparams["dynamic_batch_kwargs"]
             )
     )
-    if "valid_dynamic_batch_kwargs" in hparams:
-        validdata = (
-                wds.WebDataset(hparams["validshards"])
-                .decode()
-                .rename(trn="transcript.txt", wav="audio.pth")
-                .map(tokenize)
-                .then(
-                    sb.dataio.iterators.dynamic_bucketed_batch,
-                    drop_end=False,
-                    **hparams["valid_dynamic_batch_kwargs"]
-                )
-        )
-    else:
-        validdata = (
-                wds.WebDataset(hparams["validshards"])
-                .decode()
-                .rename(trn="transcript.txt", wav="audio.pth")
-                .map(tokenize)
-                .batched(
-                    batchsize=hparams["validbatchsize"], 
-                    collation_fn=sb.dataio.batch.PaddedBatch,
-                    partial=True
-                )
-        )
+    validdata = (
+            wds.WebDataset(hparams["validshards"])
+            .decode()
+            .rename(trn="transcript.txt", wav="audio.pth")
+            .map(tokenize)
+            .batched(
+                batchsize=hparams["validbatchsize"], 
+                collation_fn=sb.dataio.batch.PaddedBatch,
+                partial=True
+            )
+    )
     testseen = (
             wds.WebDataset(hparams["test_seen_shards"])
             .decode()
@@ -471,41 +544,37 @@ def dataio_prepare(hparams):
                 partial=True
             )
     )
-    datas = {"train": traindata, "valid": validdata, "test-seen": testseen,
+    
+    #analysis_uttids = []
+    #with open(hparams["analysis_datadir"] + "/utt2spk") as fin:
+    #    for line in fin:
+    #        uttid, _ = line.strip().split()
+    #        # HACK: WebDataset cannot handle periods in uttids:
+    #        uttid = uttid.replace(".", "")
+    #        analysis_uttids.append(uttid)
+    #analysis_uttids = set(analysis_uttids)
+    #def analysis_select(sample):
+    #    return sample["__key__"] in analysis_uttids
+#
+#    analysisdata = (
+#            wds.WebDataset(hparams["fullshards"])
+#            .decode()
+#            .select(analysis_select)
+#            .rename(trn="transcript.txt", wav="audio.pth")
+#            .map(tokenize)
+#            .then(
+#                sb.dataio.iterators.dynamic_bucketed_batch,
+#                sampler_kwargs={"target_batch_numel": 640000,"max_batch_numel": 1000000},
+#                len_key='wav'
+#            )
+#    )
+
+    
+
+    return {"train": traindata, "valid": validdata, "test-seen": testseen,
             "test-unseen": testunseen, "test2021": test2021,
             "test-speecon": test_speecon, "test-yle": test_yle,
-            "test-lp": test_lp}
-    
-    if "analysis_datadir" in hparams:
-        analysis_uttids = []
-        with open(hparams["analysis_datadir"] + "/utt2spk") as fin:
-            for line in fin:
-                uttid, _ = line.strip().split()
-                # HACK: WebDataset cannot handle periods in uttids:
-                uttid = uttid.replace(".", "")
-                analysis_uttids.append(uttid)
-        analysis_uttids = set(analysis_uttids)
-        def analysis_select(sample):
-            return sample["__key__"] in analysis_uttids
-
-        analysisdata = (
-                wds.WebDataset(hparams["fullshards"])
-                .decode()
-                .select(analysis_select)
-                .rename(trn="transcript.txt", wav="audio.pth")
-                .map(tokenize)
-                .then(
-                    sb.dataio.iterators.dynamic_bucketed_batch,
-                    sampler_kwargs={"target_batch_numel": 640000,"max_batch_numel": 1000000},
-                    len_key='wav'
-                )
-        )
-        datas["analysis"] = analysisdata
-
-    return datas
-
-    
-
+            "test-lp": test_lp, } #"analysis": analysisdata}
 
 
 
