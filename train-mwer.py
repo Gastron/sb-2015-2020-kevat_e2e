@@ -16,7 +16,7 @@ import torchaudio
 sys.path.append("local/")
 from make_shards import segments_to_output, wavscp_to_output
 import pathlib
-from minwer import minWER_loss, minWER_loss_given, compute_subwers
+from minwer_simple import minWER_loss_given
 from speechbrain.utils.edit_distance import op_table, count_ops
 import numpy as np
 
@@ -229,23 +229,15 @@ class ASR(sb.Brain):
             loss += self.hparams.ctc_weight * loss_ctc
         
         if getattr(self.hparams, "minwertype", "SubWER") == "SubWER":
-            ref_abs_lengths = torch.round(batch.tokens_eos.lengths * batch.tokens_eos.data.size(1))
-            minwerloss = minWER_loss(
-                    hypotheses = predictions["topk_hyps"],
-                    targets = batch.tokens_eos.data,
-                    hyps_lens = predictions["topk_lens"],
-                    target_lens = ref_abs_lengths,
-                    hypotheses_scores = predictions["topk_scores"],
-                    blank_index = self.hparams.mwer_pad_index,
-                    subtract_avg = self.hparams.subtract_avg
-            )
+            raise ValueError("Not supporting subword error rate any more")
         elif getattr(self.hparams, "minwertype", "SubWER") == "TrueWER":
             specials = [self.hparams.bos_index, self.hparams.eos_index, self.hparams.unk_index]
             batchsize = len(batch)
             wers = torch.zeros((batchsize,self.hparams.topk), dtype=torch.float32)
             for i, target in enumerate(batch.trn):
                 # Ad hoc filter here:
-                target_words = [t in target.split() if t not in ["<UNK>"]] 
+                #target_words = [t in target.split() if t not in ["<UNK>"]]
+                target_words = [t for t in target.split() if t not in ["<UNK>"]]
                 for j, hyp in enumerate(predictions["topk_hyps"][i]):
                     hyp = hyp.cpu().tolist()
                     hyp = [token for token in hyp if token not in specials]
@@ -258,36 +250,6 @@ class ASR(sb.Brain):
                     hypotheses_scores = predictions["topk_scores"],
                     subtract_avg = self.hparams.subtract_avg
             )
-            if hasattr(self.hparams, "save_num_errs"):
-                ref_abs_lengths = torch.round(batch.tokens_eos.lengths * batch.tokens_eos.data.size(1))
-                suberrors = compute_subwers(
-                    hypotheses = predictions["topk_hyps"],
-                    targets = batch.tokens_eos.data,
-                    hyps_lens = predictions["topk_lens"],
-                    target_lens = ref_abs_lengths,
-                )
-                suberrors = suberrors.cpu().tolist()
-                wordlevel_list = sum(wers.cpu().tolist(),[])
-                corr = np.corrcoef(np.array(wordlevel_list), np.array(suberrors))
-                if corr[0,1] < 0.6:
-                    for i, (suberr, worderr) in enumerate(zip(suberrors, wordlevel_list)):
-                        if suberr > worderr:
-                            k = self.hparams.topk
-                            hyp = predictions["topk_hyps"][i//k][i%k]
-                            hyp = hyp.cpu().tolist()
-                            print("Ref Units:", [self.hparams.tokenizer.id_to_piece(u) for u in batch.tokens_eos.data[i//k].cpu().tolist()])
-                            print("Units:", [self.hparams.tokenizer.id_to_piece(u) for u in hyp])
-                            hyp = [token for token in hyp if token not in specials]
-
-                            hyp = self.hparams.tokenizer.decode_ids(hyp).split(" ")
-                            print("Ref Word:", batch.trn[i//k].split())
-                            print("Word:", hyp)
-                    import sys; sys.exit()
-                    
-                #print("Batch level corr:", corr)
-                self.num_errs.setdefault("word", []).extend(wordlevel_list)
-                self.num_errs.setdefault("subword", []).extend(suberrors)
-
         loss = nll_loss * self.hparams.nll_weight + minwerloss
 
         if stage != sb.Stage.TRAIN:
@@ -328,9 +290,6 @@ class ASR(sb.Brain):
             self.cer_metric = self.hparams.cer_computer()
             self.wer_metric = self.hparams.error_rate_computer()
 
-        if stage == sb.Stage.TRAIN:
-            self.num_errs = {}
-
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of an epoch.
 
@@ -344,10 +303,6 @@ class ASR(sb.Brain):
             The currently-starting epoch. This is passed
             `None` during the test stage.
         """
-        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "save_num_errs"):
-            wordlevel = torch.tensor(self.num_errs["word"])
-            sublevel = torch.tensor(self.num_errs["suberrors"])
-            print("Epoch total correlation:", torch.corrcoef(wordlevel, sublevel))
 
         # Store the train loss until the validation stage.
         stage_stats = {"loss": stage_loss}
@@ -620,11 +575,13 @@ if __name__ == "__main__":
         asr_brain.hparams.epoch_counter,
         datasets["train"],
         datasets["valid"],
-        train_loader_kwargs = hparams["train_loader_kwargs"]
+        train_loader_kwargs = hparams["train_loader_kwargs"],
+        valid_loader_kwargs = hparams.get("valid_loader_kwargs", {"batch_size": None})
     )
 
     # Load best checkpoint (highest STOI) for evaluation
     test_stats = asr_brain.evaluate(
         test_set=datasets[hparams["test_data_id"]],
         min_key="WER",
+        test_loader_kwargs = hparams.get("test_loader_kwargs", {"batch_size": None})
     )

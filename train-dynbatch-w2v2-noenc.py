@@ -511,11 +511,13 @@ if __name__ == "__main__":
         asr_brain.hparams.epoch_counter,
         datasets["train"],
         datasets["valid"],
-        train_loader_kwargs = hparams["train_loader_kwargs"]
+        train_loader_kwargs = hparams["train_loader_kwargs"],
+        valid_loader_kwargs = hparams.get("valid_loader_kwargs", {})
     )
 
     # Load best checkpoint (highest STOI) for evaluation
     test_stats = asr_brain.evaluate(
         test_set=datasets[hparams["test_data_id"]],
         min_key="WER",
+        test_loader_kwargs = hparams.get("valid_loader_kwargs", {})
     )

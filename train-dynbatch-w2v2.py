@@ -209,6 +209,9 @@ class ASR(sb.Brain):
                 self.checkpointer.add_recoverable(
                     "wav2vec_opt", self.wav2vec_optimizer
                 )
+
+        for modulename in self.hparams.frozen_modules:
+            getattr(self.modules, modulename).requires_grad_(False)
         self.model_optimizer = self.hparams.model_opt_class(
             self.hparams.model.parameters()
         )
@@ -284,7 +287,8 @@ class ASR(sb.Brain):
             old_lr_model, new_lr_model = self.hparams.lr_annealing_model(stage_stats["WER"])
             sb.nnet.schedulers.update_learning_rate(self.model_optimizer, new_lr_model)
             old_lr_w2v, new_lr_w2v = self.hparams.lr_annealing_wav2vec(stage_stats["WER"])
-            sb.nnet.schedulers.update_learning_rate(self.wav2vec_optimizer, new_lr_w2v)
+            if not self.hparams.wav2vec2.freeze:
+                sb.nnet.schedulers.update_learning_rate(self.wav2vec_optimizer, new_lr_w2v)
 
             # The train_logger writes a summary to stdout and to the logfile.
             self.hparams.train_logger.log_stats(
@@ -550,11 +554,13 @@ if __name__ == "__main__":
         asr_brain.hparams.epoch_counter,
         datasets["train"],
         datasets["valid"],
-        train_loader_kwargs = hparams["train_loader_kwargs"]
+        train_loader_kwargs = hparams["train_loader_kwargs"],
+        valid_loader_kwargs = hparams.get("valid_loader_kwargs", {"batch_size": None})
     )
 
     # Load best checkpoint (highest STOI) for evaluation
     test_stats = asr_brain.evaluate(
         test_set=datasets[hparams["test_data_id"]],
         min_key="WER",
+        test_loader_kwargs = hparams.get("test_loader_kwargs", {"batch_size": None})
     )

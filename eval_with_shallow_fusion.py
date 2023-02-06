@@ -207,36 +207,11 @@ def dataio_prepare(hparams):
             )
     )
     
-    analysis_uttids = []
-    with open(hparams["analysis_datadir"] + "/utt2spk") as fin:
-        for line in fin:
-            uttid, _ = line.strip().split()
-            # HACK: WebDataset cannot handle periods in uttids:
-            uttid = uttid.replace(".", "")
-            analysis_uttids.append(uttid)
-    analysis_uttids = set(analysis_uttids)
-    def analysis_select(sample):
-        return sample["__key__"] in analysis_uttids
-
-         
-    analysisdata = (
-            wds.WebDataset(hparams["fullshards"][hparams["aindex"]::hparams["asplits"]])
-            .decode()
-            .select(analysis_select)
-            .rename(trn="transcript.txt", wav="audio.pth")
-            .map(tokenize)
-            .then(
-                sb.dataio.iterators.dynamic_bucketed_batch,
-                sampler_kwargs={"target_batch_numel": 640000,"max_batch_numel": 1000000},
-                len_key='wav'
-            )
-    )
-
     
     return {"valid": validdata, "test-seen": testseen,
             "test-unseen": testunseen, "test2021": test2021,
             "test-speecon": test_speecon, "test-yle": test_yle,
-            "test-lp": test_lp, "analysis": analysisdata}
+            "test-lp": test_lp}
     
 
 if __name__ == "__main__":
@@ -264,7 +239,10 @@ if __name__ == "__main__":
         run_opts=run_opts,
     )
 
+    test_loader_kwargs = hparams.get("test_loader_kwargs", {})
+    test_loader_kwargs.setdefault("batch_size", None)
     # Load best checkpoint (highest STOI) for evaluation
     test_stats = asr_brain.evaluate(
         test_set=datasets[hparams["test_data_id"]],
+        test_loader_kwargs = test_loader_kwargs
     )

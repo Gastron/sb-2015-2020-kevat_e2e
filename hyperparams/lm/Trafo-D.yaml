@@ -47,12 +47,16 @@ valid_dataloader_opts:
 test_dataloader_opts:
     batch_size: 1
 
-# Outputs
+test_min_key: "loss"
+test_dir: /scratch/elec/puhe/p/fin-parl-models/speechbrain_2015-2020-kevat/exp/mtl-am/New-CRDNN-J-contd/2602-2328units/decode_yle-test-new_sb-vocab-train20-varikn.d0.0001-bpe1750/5best-outputs/
+testfile: !ref <test_dir>/text
+test_out: !ref <test_dir>/lm_cost.trafo_30M
+
+unk_index: 0 
+blank_index: 0
 pad_index: 0
-blank_index: 1
-unk_index: 1
-bos_index: 2
-eos_index: 3
+bos_index: 1
+eos_index: 2
 
 # model params
 d_model: 768

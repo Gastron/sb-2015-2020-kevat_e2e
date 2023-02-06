@@ -21,7 +21,7 @@ test_lp_shards: /scratch/elec/puhe/p/lahjoita-puhetta_speechbrain/shards/lp-test
 validsamples: 1797
 # data_folder_rirs: ./augmentation_data # noise/ris dataset will automatically be downloaded here
 num_units: 1750
-output_folder: !ref exp/W2V2-D/<seed>-<num_units>units
+output_folder: !ref exp/W2V2-E/<seed>-<num_units>units
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 tokenizer_path: !ref exp/spm-train20-boseos/spm.<num_units>.model
@@ -45,8 +45,8 @@ n_mels: 40
 subsampling: 4
 
 # Training parameters
-number_of_epochs: 100
-number_of_ctc_epochs: 30 
+number_of_epochs: 50
+number_of_ctc_epochs: 50 
 dynamic_batch_kwargs:
     max_sample_len: !ref <sample_rate> * 30
     sampler_kwargs:
@@ -73,6 +73,7 @@ grad_accumulation_factor: 1
 # Model parameters
 activation: !name:torch.nn.LeakyReLU
 wav2vec_output_dim: 1024
+dnn_neurons: 1024
 freeze_wav2vec: False
 dropout: 0.15
 
@@ -96,7 +97,7 @@ test_beam_size: 4
 eos_threshold: 1.3
 using_max_attn_shift: False
 max_attn_shift: 240
-ctc_weight_decode: 0.0
+ctc_weight_decode: 0.5
 coverage_penalty: 3.0 
 temperature: 2.0
 wer_file: !ref <output_folder>/wer_<test_data_id>_beam<test_beam_size>_cov<coverage_penalty>_eos<eos_threshold>_temp<temperature>_noattnshift.txt
@@ -116,6 +117,21 @@ wav2vec2: !new:speechbrain.lobes.models.huggingface_wav2vec.HuggingFaceWav2Vec2
     freeze_feature_extractor: True
     save_path: !ref <w2v2_savepath>
 
+enc: !new:speechbrain.nnet.containers.Sequential
+    input_shape: [null, null, !ref <wav2vec_output_dim>]
+    linear1: !name:speechbrain.nnet.linear.Linear
+        n_neurons: !ref <dnn_neurons>
+        bias: True
+    bn1: !name:speechbrain.nnet.normalization.BatchNorm1d
+    activation: !new:torch.nn.LeakyReLU
+    drop: !new:torch.nn.Dropout
+        p: !ref <dropout>
+    linear2: !name:speechbrain.nnet.linear.Linear
+        n_neurons: !ref <dnn_neurons>
+        bias: True
+    bn2: !name:speechbrain.nnet.normalization.BatchNorm1d
+    activation2: !new:torch.nn.LeakyReLU
+
 # Embedding (from indexes to an embedding space of dimension emb_size).
 embedding: !new:speechbrain.nnet.embedding.Embedding
     num_embeddings: !ref <output_neurons>
@@ -123,7 +139,7 @@ embedding: !new:speechbrain.nnet.embedding.Embedding
 
 # Attention-based RNN decoder.
 decoder: !new:local_RNN.AttentionalRNNDecoder
-    enc_dim: !ref <wav2vec_output_dim>
+    enc_dim: !ref <dnn_neurons>
     input_size: !ref <emb_size>
     rnn_type: gru
     attn_type: location
@@ -158,6 +174,7 @@ ctc_cost: !name:speechbrain.nnet.losses.ctc_loss
 # device, as well as having train()/eval() called on them by the Brain class
 modules:
     wav2vec2: !ref <wav2vec2>
+    encoder: !ref <enc>
     embedding: !ref <embedding>
     decoder: !ref <decoder>
     ctc_lin: !ref <ctc_lin>
@@ -165,7 +182,7 @@ modules:
 
 # Gathering all the submodels in a single model object.
 model: !new:torch.nn.ModuleList
-    - [!ref <embedding>, !ref <ctc_lin>, !ref <seq_lin>, !ref <decoder>, !ref <wav2vec2>]
+    - [!ref <embedding>, !ref <ctc_lin>, !ref <seq_lin>, !ref <decoder>, !ref <enc>]
 
 # Beamsearch is applied on the top of the decoder. If the language model is
 # given, a language model is applied (with a weight specified in lm_weight).
@@ -223,14 +240,23 @@ test_search: !new:speechbrain.decoders.S2SRNNBeamSearcher
     ctc_weight: !ref <ctc_weight_decode>
     temperature: !ref <temperature>
 
-lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
+lr_annealing_model: !new:speechbrain.nnet.schedulers.NewBobScheduler
     initial_value: !ref <lr>
     improvement_threshold: 0.0025
     annealing_factor: 0.8
     patient: 0
 
-opt_class: !name:torch.optim.Adam
+lr_annealing_wav2vec: !new:speechbrain.nnet.schedulers.NewBobScheduler
+    initial_value: !ref <lr_wav2vec>
+    improvement_threshold: 0.0025
+    annealing_factor: 0.9
+    patient: 0
+
+model_opt_class: !name:torch.optim.Adam
       lr: !ref <lr> 
+
+wav2vec_opt_class: !name:torch.optim.Adam
+    lr: !ref <lr_wav2vec>
 
 # Functions that compute the statistics to track during the validation step.
 error_rate_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
@@ -244,6 +270,9 @@ cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
+        wav2vec2: !ref <wav2vec2>
         model: !ref <model>
         counter: !ref <epoch_counter>
-        scheduler: !ref <lr_annealing>
+        scheduler_model: !ref <lr_annealing_model>
+        scheduler_wav2vec: !ref <lr_annealing_wav2vec>
+        encoder: !ref <enc>

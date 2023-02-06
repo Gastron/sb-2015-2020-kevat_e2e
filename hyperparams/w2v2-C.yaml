@@ -45,7 +45,7 @@ n_mels: 40
 subsampling: 4
 
 # Training parameters
-number_of_epochs: 200
+number_of_epochs: 100
 number_of_ctc_epochs: 30 
 dynamic_batch_kwargs:
     max_sample_len: !ref <sample_rate> * 30
@@ -56,6 +56,9 @@ dynamic_batch_kwargs:
 train_loader_kwargs:
     num_workers: 4
     looped_nominal_epoch: 5000
+    batch_size: null
+valid_loader_kwargs:
+    batch_size: null
 validbatchsize: 4
 validbatches: !apply:math.ceil 
     - !ref <validsamples> / <validbatchsize>
